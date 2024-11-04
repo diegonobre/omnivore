@@ -1,10 +1,15 @@
 import archiver, { Archiver } from 'archiver'
 import { v4 as uuidv4 } from 'uuid'
-import { LibraryItem, LibraryItemState } from '../entity/library_item'
+import {
+  ContentReaderType,
+  LibraryItem,
+  LibraryItemState,
+} from '../entity/library_item'
 import { TaskState } from '../generated/graphql'
 import { findExportById, saveExport } from '../services/export'
 import { findHighlightsByLibraryItemId } from '../services/highlights'
 import {
+  countLibraryItems,
   findLibraryItemById,
   searchLibraryItems,
 } from '../services/library_item'
@@ -12,9 +17,16 @@ import { sendExportJobEmail } from '../services/send_emails'
 import { findActiveUser } from '../services/user'
 import { logger } from '../utils/logger'
 import { highlightToMarkdown } from '../utils/parser'
-import { contentFilePath } from '../utils/uploads'
 import { env } from '../env'
 import { File, Storage } from '@google-cloud/storage'
+import {
+  contentFilePath,
+  createGCSFile,
+  generateUploadFilePathName,
+} from '../utils/uploads'
+import { batch } from 'googleapis/build/src/apis/batch'
+import { getRepository } from '../repository'
+import { UploadFile } from '../entity/upload_file'
 
 export interface ExportJobData {
   userId: string
@@ -88,6 +100,30 @@ const uploadContent = async (
   })
 }
 
+const uploadPdfContent = async (
+  libraryItem: LibraryItem,
+  archive: Archiver
+) => {
+  const upload = await getRepository(UploadFile).findOneBy({
+    id: libraryItem.uploadFileId,
+  })
+  if (!upload || !upload.fileName) {
+    console.log(`upload does not have a filename: ${upload}`)
+    return
+  }
+
+  const filePath = generateUploadFilePathName(upload.id, upload.fileName)
+  const file = createGCSFile(filePath)
+  const [exists] = await file.exists()
+  if (exists) {
+    console.log(`adding PDF file: ${filePath}`)
+    // append the existing file to the archive
+    archive.append(file.createReadStream(), {
+      name: `content/${libraryItem.slug}.pdf`,
+    })
+  }
+}
+
 const uploadToBucket = async (
   userId: string,
   items: Array<LibraryItem>,
@@ -120,7 +156,11 @@ const uploadToBucket = async (
   // Loop through the items and add files to /content and /highlights directories
   for (const item of items) {
     // Add content files to /content
-    await uploadContent(userId, item, archive)
+    if (item.uploadFileId) {
+      await uploadPdfContent(item, archive)
+    } else {
+      await uploadContent(userId, item, archive)
+    }
 
     if (item.highlightAnnotations?.length) {
       const highlights = await findHighlightsByLibraryItemId(item.id, userId)
@@ -174,7 +214,23 @@ export const exportJob = async (jobData: ExportJobData) => {
       return
     }
 
-    logger.info('exporting all items...', {
+    const itemCount = await countLibraryItems(
+      {
+        query: 'in:all',
+        includeContent: false,
+        includeDeleted: false,
+        includePending: false,
+      },
+      userId
+    )
+
+    await saveExport(userId, {
+      id: exportId,
+      state: TaskState.Running,
+      totalItems: itemCount,
+    })
+
+    logger.info(`exporting ${itemCount} items...`, {
       userId,
     })
 
@@ -220,12 +276,16 @@ export const exportJob = async (jobData: ExportJobData) => {
     // Pipe the archiver output to the write stream
     archive.pipe(writeStream)
 
+    let cursor = 0
     try {
       // fetch data from the database
       const batchSize = 20
-      let cursor = 0
-      let hasNext = false
-      do {
+      for (cursor = 0; cursor < itemCount; cursor += batchSize) {
+        logger.info(`export extracting ${cursor} of ${itemCount}`, {
+          userId,
+          exportId,
+        })
+
         const items = await searchLibraryItems(
           {
             from: cursor,
@@ -241,11 +301,15 @@ export const exportJob = async (jobData: ExportJobData) => {
         const size = items.length
         // write data to the csv file
         if (size > 0) {
-          cursor = await uploadToBucket(userId, items, cursor, size, archive)
-
-          hasNext = size === batchSize
+          await uploadToBucket(userId, items, cursor, size, archive)
+          await saveExport(userId, {
+            id: exportId,
+            processedItems: cursor,
+          })
+        } else {
+          break
         }
-      } while (hasNext)
+      }
     } finally {
       // Finalize the archive
       await archive.finalize()
@@ -257,14 +321,14 @@ export const exportJob = async (jobData: ExportJobData) => {
       writeStream.on('error', reject)
     })
 
-    logger.info('export completed', {
+    logger.info(`export completed, exported ${cursor} items`, {
       userId,
     })
 
     // generate a temporary signed url for the zip file
     const [signedUrl] = await file.getSignedUrl({
       action: 'read',
-      expires: Date.now() + 86400 * 1000, // 15 minutes
+      expires: Date.now() + 168 * 60 * 60 * 1000, // one week
     })
 
     logger.info('signed url for export:', {
@@ -275,6 +339,8 @@ export const exportJob = async (jobData: ExportJobData) => {
     await saveExport(userId, {
       id: exportId,
       state: TaskState.Succeeded,
+      signedUrl,
+      processedItems: itemCount,
     })
 
     const job = await sendExportJobEmail(userId, 'completed', signedUrl)
